@@ -1,0 +1,19 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Secrets / local env  —— 真实密钥永不入库（.env.example 是安全模板，保留）
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 运行期缓存（a_share_names.csv 离线名称表保留，提升 clone 后首启体验）
+*.log
