@@ -29,6 +29,7 @@ import os
 import re
 from typing import Iterator, Optional
 
+import backtest as bt
 import data_source as ds
 
 MODEL = os.environ.get("HERMES_MODEL", "claude-opus-4-8")
@@ -61,6 +62,14 @@ TOOLS = [
     _tool("get_financials", "营收/归母净利润多期趋势、同比增速、最新 ROE 与销售毛利率。"),
     _tool("get_valuation", "估值：PE(TTM/静)、PB、市销率、市现率、PEG、总市值。"),
     _tool("get_news", "个股最近的新闻与公告（舆情）。用于判断近期催化与风险事件。"),
+    {"name": "run_backtest",
+     "description": "双均线策略历史回测（近三年）：快线上穿慢线持有、下穿空仓，信号次日生效、含交易成本。"
+                    "返回策略与同期买入持有基准的年化收益/最大回撤/夏普/胜率对比。用户提到回测、策略、均线时使用。",
+     "input_schema": {"type": "object",
+                      "properties": {"code": {"type": "string", "description": "6 位股票代码"},
+                                     "fast": {"type": "integer", "description": "快线窗口（日），默认 20"},
+                                     "slow": {"type": "integer", "description": "慢线窗口（日），默认 60"}},
+                      "required": ["code"]}},
 ]
 
 SYSTEM_PROMPT = """你是 Hermes，一个专业、严谨的 A 股投研助手。
@@ -68,6 +77,8 @@ SYSTEM_PROMPT = """你是 Hermes，一个专业、严谨的 A 股投研助手。
 工作方式：
 1. 先用 resolve_symbol 确定标的（拿到 6 位代码）。
 2. 调用数据工具获取基本面、价格、财务、估值、舆情（都是真实市场数据）。
+   若用户要求回测/策略验证，调用 run_backtest（双均线）；解读回测必须与买入持有基准对比，
+   并说明单一参数存在过拟合风险，此时研报增加「## 策略回测」小节。
 3. 写一份结构化中文迷你研报（Markdown），包含：
    ## 一句话结论
    ## 公司概览
@@ -104,6 +115,11 @@ def _run_tool(name: str, args: dict, collected: dict) -> dict:
     code = args.get("code") or collected.get("code")
     if not code:
         return {"_error": "缺少股票代码，请先 resolve_symbol"}
+    if name == "run_backtest":
+        out = bt.run_backtest(code, args.get("fast") or bt.DEFAULT_FAST,
+                              args.get("slow") or bt.DEFAULT_SLOW)
+        collected["backtest"] = out
+        return out
     fn = {"get_basics": ds.get_basics, "get_price_history": ds.get_price_history,
           "get_financials": ds.get_financials, "get_valuation": ds.get_valuation,
           "get_news": ds.get_news}.get(name)
@@ -131,6 +147,11 @@ def _summarize_tool(name: str, out: dict) -> str:
         return f"取估值 → PE(TTM) {out.get('pe_ttm')}，PB {out.get('pb')}"
     if name == "get_news":
         return f"采集舆情 → {len(out.get('items', []))} 条近期新闻/公告"
+    if name == "run_backtest":
+        m = out.get("metrics", {})
+        return (f"回测 {out.get('strategy')} → 年化 {m.get('annual_return_pct')}%，"
+                f"最大回撤 {m.get('max_drawdown_pct')}%，夏普 {m.get('sharpe')}，"
+                f"对买入持有超额 {out.get('excess_return_pct')}%")
     return "完成"
 
 
@@ -150,6 +171,27 @@ def _yi(v) -> str:
 # --------------------------------------------------------------------------- #
 _SEP = re.compile(r"\s*(?:对比|相比|比较|和|与|跟|及|vs\.?|VS\.?|、|，|,|/)\s*")
 _LEAD = re.compile(r"^(?:请?帮我?)?(?:对比|比较|分析|看看|看一下|研究)(?:一下|下)?\s*")
+_BT_RE = re.compile(r"回测|双均线|均线策略")
+_BT_PARAM_RE = re.compile(r"(\d{1,3})\s*[/、,，]\s*(\d{1,3})")  # 如「20/60」；要求分隔符，避免误吞 6 位股票代码
+
+
+def _parse_backtest_intent(query: str) -> Optional[dict]:
+    """识别「回测 XX」类意图。返回 {target, fast, slow}，非回测意图返回 None。"""
+    if not _BT_RE.search(query or ""):
+        return None
+    fast, slow = bt.DEFAULT_FAST, bt.DEFAULT_SLOW
+    q = query
+    m = _BT_PARAM_RE.search(q)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if a > 0 and b > 0 and a != b:
+            fast, slow = min(a, b), max(a, b)
+        q = q.replace(m.group(0), " ")
+    q = re.sub(r"用(?=\s*(?:双均线|均线|策略|回测))", " ", q)  # 「用双均线回测」的「用」；不误伤「用友网络」
+    q = re.sub(r"回测|双均线|均线策略|策略|均线|一下|帮我|请|麻烦", " ", q).strip()
+    q = _LEAD.sub("", q)
+    target = _SEP.split(q)[0].strip() if q.strip() else ""
+    return {"target": target or query, "fast": fast, "slow": slow}
 
 
 def _split_targets(query: str) -> list[str]:
@@ -172,6 +214,17 @@ def analyze_events(query: str) -> Iterator[dict]:
         yield {"type": "error", "error": "请输入要分析的股票名称或代码"}
         return
     try:
+        bt_intent = _parse_backtest_intent(query)
+        if bt_intent:
+            r = ds.resolve_symbol(bt_intent["target"])
+            if not r.get("ok"):
+                yield {"type": "error",
+                       "error": r.get("error", f"没找到「{bt_intent['target']}」对应的 A 股")}
+                return
+            yield from _events_backtest(query, r, bt_intent["fast"], bt_intent["slow"])
+            yield {"type": "done"}
+            return
+
         targets = _split_targets(query)
         resolved, seen = [], set()
         for t in targets:
@@ -264,6 +317,57 @@ def _events_compare(query: str, resolved: list[dict]) -> Iterator[dict]:
     yield {"type": "comparison", "mode": mode,
            "comparison": {"query": query, "stocks": stocks, "analysis_md": analysis,
                           "generated_at": _now()}}
+
+
+def _events_backtest(query: str, r: dict, fast: int, slow: int) -> Iterator[dict]:
+    """回测意图的确定性流水线：回测由代码裁决，AI（若有 key）只负责解读。"""
+    code, name = r["code"], r["name"]
+    yield {"type": "step", "summary": f"识别标的 → {name}（{code}）"}
+    yield {"type": "step", "summary": f"取近三年复权行情，回测 双均线 MA{fast}/MA{slow}（信号次日生效，含交易成本）…"}
+    result = bt.run_backtest(code, fast, slow)
+    if result.get("_error"):
+        yield {"type": "error", "error": f"回测失败：{result['_error']}"}
+        return
+    yield {"type": "step", "summary": _summarize_tool("run_backtest", result)}
+
+    md = bt.format_report(result, name)
+    mode = "demo"
+    if has_api_key():
+        yield {"type": "step", "summary": "生成 AI 解读…"}
+        interp = _ai_backtest_interpret(name, result)
+        if interp:
+            md = interp + "\n\n---\n\n" + md
+            mode = "ai"
+
+    yield {"type": "step", "summary": "补齐基本面/估值/舆情，组装报告…"}
+    data = ds.collect_all(code, name)
+    report = _assemble_report(query, {**data, "code": code, "name": name}, md)
+    report["backtest"] = result
+    yield {"type": "report", "mode": mode, "report": report}
+
+
+BACKTEST_SYSTEM = """你是 Hermes 投研助手。下面是一份双均线策略回测结果 JSON——
+由确定性代码基于真实历史行情计算，数字不可更改，你的任务只是解读。
+写一段简洁中文解读（Markdown，250 字内）：
+- 策略与买入持有基准的对比结论（看年化、最大回撤、夏普，谁好、好在哪）
+- 胜率与交易次数说明了什么
+- 局限性：单一参数事后选择存在过拟合风险、样本区间有限
+客观中立，不给买卖指令；不要复述表格数字本身，重在解读；结尾一句风险提示。"""
+
+
+def _ai_backtest_interpret(name: str, result: dict) -> str:
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model=MODEL, max_tokens=2000,
+            thinking={"type": "adaptive"}, output_config={"effort": EFFORT},
+            system=BACKTEST_SYSTEM,
+            messages=[{"role": "user", "content": f"标的：{name}\n" + json.dumps(result, ensure_ascii=False)}],
+        )
+        return "".join(b.text for b in resp.content if b.type == "text")
+    except Exception:
+        return ""
 
 
 # --------------------------------------------------------------------------- #
