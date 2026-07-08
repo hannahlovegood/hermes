@@ -6,14 +6,20 @@ app.py — Hermes 的 Web/接入入口（对应卡片「多端接入：飞书/We
   GET  /api/analyze/stream   → SSE 流式：实时把 Agent 轨迹 + 研报/对比 推给前端
   POST /api/analyze          → 非流式 JSON（兜底/外部调用）
   POST /api/feishu/webhook   → 飞书机器人事件回调（设了 FEISHU_* 才有意义）
+  GET  /api/wechat/webhook   → 微信公众号服务器配置校验（设了 WECHAT_* 才有意义）
+  POST /api/wechat/webhook   → 微信公众号消息回调（测试号即可）
 
 启动： ./run.sh   或   .venv/bin/python -m uvicorn app:app --reload
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import threading
+import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -34,6 +40,10 @@ INDEX = BASE / "static" / "index.html"
 
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
+
+WECHAT_TOKEN = os.environ.get("WECHAT_TOKEN", "")
+WECHAT_APPID = os.environ.get("WECHAT_APPID", "")
+WECHAT_APPSECRET = os.environ.get("WECHAT_APPSECRET", "")
 
 
 def _warm() -> None:
@@ -63,7 +73,8 @@ def favicon() -> Response:
 @app.get("/api/status")
 def status() -> dict:
     return {"mode": "ai" if agent.has_api_key() else "demo", "model": agent.MODEL,
-            "feishu": bool(FEISHU_APP_ID and FEISHU_APP_SECRET)}
+            "feishu": bool(FEISHU_APP_ID and FEISHU_APP_SECRET),
+            "wechat": bool(WECHAT_TOKEN and WECHAT_APPID and WECHAT_APPSECRET)}
 
 
 # ----- 流式（SSE）：前端 EventSource 消费 -----
@@ -115,7 +126,7 @@ def _feishu_reply(message_id: str, text: str) -> None:
 
 
 def _result_to_text(res: dict) -> str:
-    """把 analyze 结果压成飞书纯文本回复。"""
+    """把 analyze 结果压成纯文本回复（飞书 / 微信共用）。"""
     if not res.get("ok"):
         return "⚠️ " + res.get("error", "分析失败")
     if "comparison" in res:
@@ -170,3 +181,122 @@ async def feishu_webhook(req: Request) -> dict:
     except Exception:
         pass
     return {"code": 0}
+
+
+# --------------------------------------------------------------------------- #
+# 微信公众号接入（测试号即可，明文模式）
+# --------------------------------------------------------------------------- #
+# 流程：收到文本消息 → 5 秒内被动回一句「分析中」→ 后台线程跑 analyze →
+#       通过客服消息接口把研报推回去（测试号自带该权限，不受 5 秒限制）。
+_wechat_tok: dict = {"token": "", "exp": 0.0}
+_wechat_tok_lock = threading.Lock()
+
+
+def _wechat_sign_ok(signature: str, timestamp: str, nonce: str) -> bool:
+    """微信服务器每次请求都带签名：sha1(sorted(token, timestamp, nonce))。"""
+    if not WECHAT_TOKEN:
+        return False
+    raw = "".join(sorted([WECHAT_TOKEN, timestamp, nonce])).encode()
+    return hmac.compare_digest(hashlib.sha1(raw).hexdigest(), signature)
+
+
+def _wechat_access_token(force: bool = False) -> str:
+    with _wechat_tok_lock:
+        if not force and _wechat_tok["token"] and time.time() < _wechat_tok["exp"]:
+            return _wechat_tok["token"]
+        try:
+            r = requests.get(
+                "https://api.weixin.qq.com/cgi-bin/token",
+                params={"grant_type": "client_credential",
+                        "appid": WECHAT_APPID, "secret": WECHAT_APPSECRET},
+            ).json()
+            _wechat_tok["token"] = r.get("access_token", "")
+            # 官方 7200s 有效，提前 5 分钟刷新
+            _wechat_tok["exp"] = time.time() + int(r.get("expires_in", 7200)) - 300
+        except Exception:
+            _wechat_tok["token"] = ""
+        return _wechat_tok["token"]
+
+
+def _wechat_push(openid: str, text: str) -> None:
+    """客服消息接口推文本。单条 2048 字节上限 → 按 600 字切块，最多 3 块。"""
+    chunks = [text[i:i + 600] for i in range(0, len(text), 600)][:3]
+    for chunk in chunks:
+        try:
+            token = _wechat_access_token()
+            if not token:
+                return
+            r = requests.post(
+                "https://api.weixin.qq.com/cgi-bin/message/custom/send",
+                params={"access_token": token},
+                data=json.dumps({"touser": openid, "msgtype": "text",
+                                 "text": {"content": chunk}}, ensure_ascii=False).encode(),
+                headers={"Content-Type": "application/json"},
+            ).json()
+            if r.get("errcode") in (40001, 42001):  # token 失效 → 强刷重试一次
+                token = _wechat_access_token(force=True)
+                if not token:
+                    return
+                requests.post(
+                    "https://api.weixin.qq.com/cgi-bin/message/custom/send",
+                    params={"access_token": token},
+                    data=json.dumps({"touser": openid, "msgtype": "text",
+                                     "text": {"content": chunk}}, ensure_ascii=False).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+        except Exception:
+            pass
+
+
+def _wechat_process(text: str, openid: str) -> None:
+    res = agent.analyze(text)
+    _wechat_push(openid, _result_to_text(res))
+
+
+def _wechat_xml(to_user: str, from_user: str, content: str) -> Response:
+    """被动回复 XML（必须 5 秒内返回）。"""
+    content = content.replace("]]>", "]] >")  # 防 CDATA 逃逸
+    xml = (f"<xml><ToUserName><![CDATA[{to_user}]]></ToUserName>"
+           f"<FromUserName><![CDATA[{from_user}]]></FromUserName>"
+           f"<CreateTime>{int(time.time())}</CreateTime>"
+           f"<MsgType><![CDATA[text]]></MsgType>"
+           f"<Content><![CDATA[{content}]]></Content></xml>")
+    return Response(content=xml, media_type="application/xml")
+
+
+@app.get("/api/wechat/webhook")
+def wechat_verify(signature: str = "", timestamp: str = "", nonce: str = "",
+                  echostr: str = "") -> Response:
+    """公众号后台「服务器配置」保存时的校验：签名对得上就原样回 echostr。"""
+    if _wechat_sign_ok(signature, timestamp, nonce):
+        return Response(content=echostr, media_type="text/plain")
+    return Response(content="bad signature", status_code=403)
+
+
+@app.post("/api/wechat/webhook")
+async def wechat_webhook(req: Request, signature: str = "", timestamp: str = "",
+                         nonce: str = "") -> Response:
+    if not _wechat_sign_ok(signature, timestamp, nonce):
+        return Response(content="bad signature", status_code=403)
+    try:
+        root = ET.fromstring(await req.body())
+        get = lambda tag: (root.findtext(tag) or "").strip()  # noqa: E731
+        openid, account = get("FromUserName"), get("ToUserName")
+        msg_type = get("MsgType")
+
+        # 新关注 → 欢迎语
+        if msg_type == "event" and get("Event").lower() == "subscribe":
+            return _wechat_xml(openid, account,
+                               "👋 欢迎使用 Hermes 投研助手！\n"
+                               "直接发股票名或代码即可，如「贵州茅台」；\n"
+                               "也支持「对比 茅台 和 五粮液」「回测 贵州茅台」。")
+
+        # 文本消息 → 先 ack 再后台分析，结果走客服消息推送
+        if msg_type == "text":
+            text = get("Content")
+            if text:
+                threading.Thread(target=_wechat_process, args=(text, openid), daemon=True).start()
+                return _wechat_xml(openid, account, "📥 已收到，正在取数分析（约 1~2 分钟），完成后自动发你。")
+    except Exception:
+        pass
+    return Response(content="success", media_type="text/plain")  # 微信约定：回 success 表示不再重试
